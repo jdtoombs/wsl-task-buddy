@@ -25,6 +25,7 @@ const (
 	modeEdit
 	modeConfirmDelete
 	modeHelp
+	modeTimeEdit
 )
 
 type model struct {
@@ -225,6 +226,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateEdit(msg)
 		case modeConfirmDelete:
 			return m.updateConfirmDelete(msg)
+		case modeTimeEdit:
+			return m.updateTimeEdit(msg)
 		default:
 			return m.updateNormal(msg)
 		}
@@ -302,6 +305,11 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.input = m.data.Tasks[idx].Title
 			m.editCursor = utf8.RuneCountInString(m.input)
 			m.mode = modeEdit
+		}
+	case "T":
+		if len(indices) > 0 {
+			m.mode = modeTimeEdit
+			m.input = ""
 		}
 	case "?":
 		m.mode = modeHelp
@@ -426,6 +434,108 @@ func (m model) updateEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			runes = append(runes[:m.editCursor], append([]rune{r}, runes[m.editCursor:]...)...)
 			m.editCursor++
 			m.input = string(runes)
+		}
+	}
+	return m, nil
+}
+
+func parseDurationInput(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty duration")
+	}
+	// try H:MM or HH:MM format
+	if parts := strings.SplitN(s, ":", 2); len(parts) == 2 {
+		var h, m int
+		if _, err := fmt.Sscanf(parts[0], "%d", &h); err != nil {
+			return 0, fmt.Errorf("invalid hours: %s", parts[0])
+		}
+		if _, err := fmt.Sscanf(parts[1], "%d", &m); err != nil {
+			return 0, fmt.Errorf("invalid minutes: %s", parts[1])
+		}
+		if h < 0 || m < 0 {
+			return 0, fmt.Errorf("duration must be positive")
+		}
+		d := time.Duration(h)*time.Hour + time.Duration(m)*time.Minute
+		if d <= 0 {
+			return 0, fmt.Errorf("duration must be positive")
+		}
+		return d, nil
+	}
+	// try XhYm format (e.g. "1h30m", "45m", "2h")
+	hIdx := strings.Index(s, "h")
+	mIdx := strings.Index(s, "m")
+	if hIdx >= 0 || mIdx >= 0 {
+		var hours, mins int
+		if hIdx >= 0 {
+			if _, err := fmt.Sscanf(s[:hIdx], "%d", &hours); err != nil {
+				return 0, fmt.Errorf("invalid hours: %s", s[:hIdx])
+			}
+			if mIdx > hIdx {
+				if _, err := fmt.Sscanf(s[hIdx+1:mIdx], "%d", &mins); err != nil {
+					return 0, fmt.Errorf("invalid minutes: %s", s[hIdx+1:mIdx])
+				}
+			}
+		} else if mIdx >= 0 {
+			if _, err := fmt.Sscanf(s[:mIdx], "%d", &mins); err != nil {
+				return 0, fmt.Errorf("invalid minutes: %s", s[:mIdx])
+			}
+		}
+		d := time.Duration(hours)*time.Hour + time.Duration(mins)*time.Minute
+		if d <= 0 {
+			return 0, fmt.Errorf("duration must be positive")
+		}
+		return d, nil
+	}
+	// plain number = minutes
+	var mins int
+	if _, err := fmt.Sscanf(s, "%d", &mins); err != nil {
+		return 0, fmt.Errorf("invalid duration: %s", s)
+	}
+	if mins <= 0 {
+		return 0, fmt.Errorf("duration must be positive")
+	}
+	return time.Duration(mins) * time.Minute, nil
+}
+
+func (m model) updateTimeEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		if m.timerTaskID >= 0 {
+			m.stopTimer()
+			m.save()
+		}
+		return m, tea.Quit
+	case "enter":
+		dur, err := parseDurationInput(m.input)
+		if err != nil {
+			m.err = err.Error()
+			m.mode = modeNormal
+			m.input = ""
+			return m, nil
+		}
+		indices := m.tasksForDate()
+		if len(indices) > 0 {
+			idx := indices[m.cursor]
+			now := time.Now()
+			start := now.Add(-dur)
+			end := now
+			m.data.Tasks[idx].Entries = append(m.data.Tasks[idx].Entries, store.TimeEntry{Start: start, End: &end})
+			m.save()
+		}
+		m.mode = modeNormal
+		m.input = ""
+	case "esc":
+		m.mode = modeNormal
+		m.input = ""
+	case "backspace":
+		if len(m.input) > 0 {
+			_, size := utf8.DecodeLastRuneInString(m.input)
+			m.input = m.input[:len(m.input)-size]
+		}
+	default:
+		if utf8.RuneCountInString(msg.String()) == 1 {
+			m.input += msg.String()
 		}
 	}
 	return m, nil
@@ -596,6 +706,13 @@ func (m model) View() string {
 		b.WriteString("\n")
 	}
 
+	if m.mode == modeTimeEdit && len(indices) > 0 {
+		idx := indices[m.cursor]
+		b.WriteString("\n")
+		b.WriteString(pad + inputStyle.Render(fmt.Sprintf("add time to \"%s\": %s_  (e.g. 1h30m, 45m, 1:30)", m.data.Tasks[idx].Title, m.input)))
+		b.WriteString("\n")
+	}
+
 	if m.mode == modeConfirmDelete && len(indices) > 0 {
 		idx := indices[m.cursor]
 		b.WriteString("\n")
@@ -618,6 +735,7 @@ func (m model) View() string {
 			"i       edit task name",
 			"enter   toggle done",
 			"s       start/stop timer",
+			"T       add time manually",
 			"d/x     delete task",
 			"n       send notification",
 			"j/k     move up/down",
