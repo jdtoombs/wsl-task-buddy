@@ -745,18 +745,29 @@ func (m model) View() string {
 			"?       toggle this help",
 			"q       quit",
 		}
+		// Find the widest line to align the block as a unit
+		maxWidth := 0
+		for _, line := range helpLines {
+			if lw := lipgloss.Width(line); lw > maxWidth {
+				maxWidth = lw
+			}
+		}
+		pad := ""
+		if maxWidth < w {
+			pad = strings.Repeat(" ", (w-maxWidth)/2)
+		}
 		for i, line := range helpLines {
 			if i == 0 {
 				b.WriteString(centerText(selectedStyle.Render(line), w))
 			} else {
-				b.WriteString(centerText(helpStyle.Render(line), w))
+				b.WriteString(pad + helpStyle.Render(line))
 			}
 			b.WriteString("\n")
 		}
 	}
 
 	contentLines := strings.Count(b.String(), "\n")
-	padding := m.height - contentLines - 3
+	padding := m.height - contentLines - 2
 	if padding > 0 {
 		b.WriteString(strings.Repeat("\n", padding))
 	}
