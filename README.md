@@ -24,7 +24,15 @@ Or run directly without building:
 go run .
 ```
 
-Tasks are stored in `~/.tasks.json`.
+Tasks are stored in `~/.tasks.json`. Incomplete tasks from past dates are automatically carried forward to today on launch.
+
+## Features
+
+- Vim-style navigation with date-based task filtering
+- Timer tracking with start/stop per task
+- Manual time entry (e.g. `1h30m`, `45m`, `1:30`)
+- Carry-forward of incomplete past tasks to today
+- Desktop notifications for tasks with `@HH:MMam/pm` in the title
 
 ## Keybindings
 
@@ -34,7 +42,12 @@ Tasks are stored in `~/.tasks.json`.
 | `h` / `l` / left/right | Navigate days |
 | `t` | Jump to today |
 | `g` / `G` | Jump to top/bottom |
-| `+` / `a` | Add task |
+| `+` / `o` | Add task |
+| `i` | Edit task name |
 | `enter` / `space` | Toggle done |
-| `d` / `x` | Delete task |
+| `s` | Start/stop timer |
+| `T` | Add time manually |
+| `d` / `x` | Delete task (with confirmation) |
+| `n` | Send notification for selected task |
+| `?` | Toggle help overlay |
 | `q` / `ctrl+c` | Quit |

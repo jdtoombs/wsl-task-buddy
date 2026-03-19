@@ -17,15 +17,17 @@ go build -o task-buddy .
 Root-level `main.go` using the Elm architecture via Bubble Tea, with `store/` package for data types and persistence:
 - `model` holds all state: tasks, cursor position, current date, input mode
 - `store.TaskData` holds the persisted task collection
-- `Update()` handles key events, delegates to `updateNormal()` / `updateInsert()` based on mode
+- `Update()` handles key events, delegates to `updateNormal()` / `updateInsert()` / `updateEdit()` / `updateConfirmDelete()` / `updateTimeEdit()` based on mode
 - `View()` renders fullscreen with date header, task list, and bottom help bar
-- Three modes: normal (vim navigation), insert (typing a new task title), and edit (renaming a task)
+- Six modes: normal (vim navigation), insert (new task), edit (rename task), confirmDelete, help overlay, timeEdit (manual time entry)
 - Timer support: tracks time per task via `store.TimeEntry`, with start/stop in normal mode
+- Manual time entry: `T` key allows adding time in formats like `1h30m`, `45m`, `1:30`
+- Carry-forward: on launch, incomplete past tasks are copied to today (originals marked done), tracked via `CarriedFromID` to prevent duplicates
 - Reminder system: tasks with `@HH:MMam/pm` in the title trigger WSL notifications when due
 
 ## Data
 - Tasks persist to `~/.tasks.json` as a flat JSON array
-- Each task has: id, title, done (bool), date (YYYY-MM-DD), notified (bool), entries (time tracking)
+- Each task has: id, title, done (bool), date (YYYY-MM-DD), notified (bool), entries (time tracking), carried_from_id (optional, tracks carry-forward origin)
 - Tasks are filtered by the currently viewed date
 - Time entries track start/end timestamps per task for timer functionality
 
@@ -38,6 +40,7 @@ Root-level `main.go` using the Elm architecture via Bubble Tea, with `store/` pa
 - `i`: edit task name
 - `enter` or `space`: toggle done
 - `s`: start/stop timer on selected task
+- `T`: add time manually (e.g. 1h30m, 45m, 1:30)
 - `d` or `x`: delete task (with confirmation)
 - `n`: send notification for selected task
 - `?`: toggle help overlay
