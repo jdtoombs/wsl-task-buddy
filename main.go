@@ -43,16 +43,16 @@ type model struct {
 	editCursor  int
 }
 
-type uiTickMsg time.Time
 type reminderTickMsg time.Time
+type timerTickMsg time.Time
 type notifyDoneMsg struct{}
-
-func uiTickCmd() tea.Cmd {
-	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return uiTickMsg(t) })
-}
 
 func reminderTickCmd() tea.Cmd {
 	return tea.Tick(30*time.Second, func(t time.Time) tea.Msg { return reminderTickMsg(t) })
+}
+
+func timerTickCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return timerTickMsg(t) })
 }
 
 var timeTagRegex = regexp.MustCompile(`@(\d{1,2}):(\d{2})(am|pm)`)
@@ -190,7 +190,11 @@ func initialModel() model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(uiTickCmd(), reminderTickCmd())
+	cmds := []tea.Cmd{reminderTickCmd()}
+	if m.timerTaskID >= 0 {
+		cmds = append(cmds, timerTickCmd())
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -199,11 +203,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		return m, nil
-	case uiTickMsg:
-		return m, uiTickCmd()
 	case reminderTickMsg:
 		cmd := m.checkReminders()
 		return m, tea.Batch(cmd, reminderTickCmd())
+	case timerTickMsg:
+		if m.timerTaskID >= 0 {
+			return m, timerTickCmd()
+		}
+		return m, nil
 	case notifyDoneMsg:
 		return m, nil
 	case tea.KeyMsg:
@@ -283,6 +290,8 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.stopTimer()
 			} else {
 				m.startTimer(globalIdx)
+				m.save()
+				return m, timerTickCmd()
 			}
 			m.save()
 		}
