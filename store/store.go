@@ -15,12 +15,13 @@ type TimeEntry struct {
 }
 
 type Task struct {
-	ID       int         `json:"id"`
-	Title    string      `json:"title"`
-	Done     bool        `json:"done"`
-	Date     string      `json:"date"`
-	Notified bool        `json:"notified,omitempty"`
-	Entries  []TimeEntry `json:"entries,omitempty"`
+	ID             int         `json:"id"`
+	Title          string      `json:"title"`
+	Done           bool        `json:"done"`
+	Date           string      `json:"date"`
+	Notified       bool        `json:"notified,omitempty"`
+	Entries        []TimeEntry `json:"entries,omitempty"`
+	CarriedFromID  int         `json:"carried_from_id,omitempty"`
 }
 
 func (t Task) TotalTime() time.Duration {
@@ -188,6 +189,42 @@ func FindRunningTimerID(s TaskData) int {
 		}
 	}
 	return -1
+}
+
+// CarryForwardTasks copies incomplete tasks from past dates into today,
+// marking the originals as done so they won't be carried again.
+// Uses CarriedFromID to track origin, avoiding duplicates even after renames.
+func CarryForwardTasks(s *TaskData, today string) bool {
+	// Build set of source IDs already carried into today
+	carriedIDs := make(map[int]bool)
+	for _, t := range s.Tasks {
+		if t.Date == today && t.CarriedFromID > 0 {
+			carriedIDs[t.CarriedFromID] = true
+		}
+	}
+	changed := false
+	// range snapshots len; appended tasks won't be revisited
+	for i, t := range s.Tasks {
+		if t.Date >= today || t.Done {
+			continue
+		}
+		if carriedIDs[t.ID] {
+			continue
+		}
+		newTask := Task{
+			ID:            s.NextID,
+			Title:         t.Title,
+			Date:          today,
+			CarriedFromID: t.ID,
+		}
+		s.NextID++
+		s.Tasks = append(s.Tasks, newTask)
+		// Mark original as done so it won't be carried again
+		s.Tasks[i].Done = true
+		carriedIDs[t.ID] = true
+		changed = true
+	}
+	return changed
 }
 
 func FormatDuration(d time.Duration) string {

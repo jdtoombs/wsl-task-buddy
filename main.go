@@ -163,6 +163,19 @@ func initialModel() model {
 		return model{err: err.Error(), timerTaskID: -1}
 	}
 	s, loadErr := store.Load(path)
+	today := time.Now().Format("2006-01-02")
+	if store.CarryForwardTasks(&s, today) {
+		if saveErr := store.Save(path, s); saveErr != nil {
+			return model{
+				data:        s,
+				date:        time.Now(),
+				savePath:    path,
+				timerTaskID: store.FindRunningTimerID(s),
+				lastChecked: time.Now(),
+				err:         saveErr.Error(),
+			}
+		}
+	}
 	m := model{
 		data:        s,
 		date:        time.Now(),

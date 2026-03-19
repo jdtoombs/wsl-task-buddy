@@ -281,3 +281,78 @@ func TestFindRunningTimerIDNone(t *testing.T) {
 		t.Errorf("expected -1, got %d", id)
 	}
 }
+
+func TestCarryForwardBasic(t *testing.T) {
+	data := TaskData{NextID: 3, Tasks: []Task{
+		{ID: 1, Title: "incomplete", Date: "2025-01-01", Done: false},
+		{ID: 2, Title: "done task", Date: "2025-01-01", Done: true},
+	}}
+	changed := CarryForwardTasks(&data, "2025-01-05")
+	if !changed {
+		t.Fatal("expected changes")
+	}
+	if len(data.Tasks) != 3 {
+		t.Fatalf("expected 3 tasks, got %d", len(data.Tasks))
+	}
+	carried := data.Tasks[2]
+	if carried.Title != "incomplete" || carried.Date != "2025-01-05" {
+		t.Errorf("carried task wrong: %+v", carried)
+	}
+	if carried.CarriedFromID != 1 {
+		t.Errorf("expected CarriedFromID=1, got %d", carried.CarriedFromID)
+	}
+	// Original should be marked done
+	if !data.Tasks[0].Done {
+		t.Error("original task should be marked done after carry")
+	}
+}
+
+func TestCarryForwardSkipsDone(t *testing.T) {
+	data := TaskData{NextID: 2, Tasks: []Task{
+		{ID: 1, Title: "done", Date: "2025-01-01", Done: true},
+	}}
+	changed := CarryForwardTasks(&data, "2025-01-05")
+	if changed {
+		t.Error("should not carry done tasks")
+	}
+	if len(data.Tasks) != 1 {
+		t.Errorf("expected 1 task, got %d", len(data.Tasks))
+	}
+}
+
+func TestCarryForwardNoDuplicateAfterDelete(t *testing.T) {
+	// Simulate: task was carried (original marked done), user deleted the carried copy.
+	// On next launch, it should NOT be re-carried because the original is done.
+	data := TaskData{NextID: 3, Tasks: []Task{
+		{ID: 1, Title: "task", Date: "2025-01-01", Done: true}, // marked done by carry
+	}}
+	changed := CarryForwardTasks(&data, "2025-01-05")
+	if changed {
+		t.Error("should not re-carry a task whose original is already done")
+	}
+}
+
+func TestCarryForwardNoDuplicateByID(t *testing.T) {
+	// Task already carried into today (CarriedFromID set) - don't carry again
+	data := TaskData{NextID: 4, Tasks: []Task{
+		{ID: 1, Title: "old name", Date: "2025-01-01", Done: true},
+		{ID: 3, Title: "renamed", Date: "2025-01-05", CarriedFromID: 1},
+	}}
+	changed := CarryForwardTasks(&data, "2025-01-05")
+	if changed {
+		t.Error("should not duplicate already-carried task even with different title")
+	}
+	if len(data.Tasks) != 2 {
+		t.Errorf("expected 2 tasks, got %d", len(data.Tasks))
+	}
+}
+
+func TestCarryForwardSkipsFutureDates(t *testing.T) {
+	data := TaskData{NextID: 2, Tasks: []Task{
+		{ID: 1, Title: "future", Date: "2025-12-31", Done: false},
+	}}
+	changed := CarryForwardTasks(&data, "2025-01-05")
+	if changed {
+		t.Error("should not carry future tasks")
+	}
+}
