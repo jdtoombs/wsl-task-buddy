@@ -4,8 +4,10 @@ package store
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -18,6 +20,8 @@ type TimeEntry struct {
 const (
 	TaskContextPersonal = "personal"
 	TaskContextWork     = "work"
+
+	NotesDirEnv = "TASK_BUDDY_NOTES_DIR"
 )
 
 func NormalizeTaskContext(context string) string {
@@ -69,6 +73,42 @@ func DataPath() (string, error) {
 	return filepath.Join(home, ".tasks.json"), nil
 }
 
+func NotesDir() (string, error) {
+	path := strings.TrimSpace(os.Getenv(NotesDirEnv))
+	if path == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot determine home directory: %w", err)
+		}
+		path = filepath.Join(home, ".task-buddy", "notes")
+	} else if path == "~" || strings.HasPrefix(path, "~/") || strings.HasPrefix(path, "~\\") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot determine home directory: %w", err)
+		}
+		if path == "~" {
+			path = home
+		} else {
+			path = filepath.Join(home, strings.TrimLeft(path[1:], `/\\`))
+		}
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve notes directory: %w", err)
+	}
+	if err := os.MkdirAll(abs, 0755); err != nil {
+		return "", fmt.Errorf("create notes directory: %w", err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("stat notes directory: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("notes path is not a directory: %s", abs)
+	}
+	return abs, nil
+}
+
 func Load(path string) (TaskData, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -112,6 +152,258 @@ func Save(path string, s TaskData) error {
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("rename: %w", err)
+	}
+	return nil
+}
+
+type NoteEntry struct {
+	Name    string
+	RelPath string
+	IsDir   bool
+	Size    int64
+}
+
+func cleanRelativePath(rel string) (string, error) {
+	rel = strings.TrimSpace(rel)
+	if rel == "" || rel == "." {
+		return "", nil
+	}
+	if filepath.IsAbs(rel) {
+		return "", fmt.Errorf("absolute paths are not allowed: %s", rel)
+	}
+	cleaned := filepath.Clean(rel)
+	if cleaned == "." {
+		return "", nil
+	}
+	for _, part := range strings.Split(cleaned, string(os.PathSeparator)) {
+		if part == "" || part == "." || part == ".." {
+			return "", fmt.Errorf("unsafe path segment %q in %s", part, rel)
+		}
+	}
+	return cleaned, nil
+}
+
+func pathInsideRoot(root, path string) (bool, error) {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false, err
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)), nil
+}
+
+func ResolveNotePath(root, rel string) (string, error) {
+	if strings.TrimSpace(root) == "" {
+		return "", fmt.Errorf("notes root is empty")
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve notes root: %w", err)
+	}
+	realRoot, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolve notes root symlinks: %w", err)
+	}
+	cleanRel, err := cleanRelativePath(rel)
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(absRoot, cleanRel)
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve note path: %w", err)
+	}
+	inside, err := pathInsideRoot(absRoot, absPath)
+	if err != nil {
+		return "", fmt.Errorf("compare note path: %w", err)
+	}
+	if !inside {
+		return "", fmt.Errorf("path escapes notes root: %s", rel)
+	}
+
+	// If the path or its nearest existing parent contains symlinks, make sure the
+	// real filesystem location still remains inside the notes root. This rejects
+	// creating or editing notes through symlinks that point outside the root.
+	checkPath := absPath
+	for {
+		realPath, err := filepath.EvalSymlinks(checkPath)
+		if err == nil {
+			inside, err := pathInsideRoot(realRoot, realPath)
+			if err != nil {
+				return "", fmt.Errorf("compare real note path: %w", err)
+			}
+			if !inside {
+				return "", fmt.Errorf("path escapes notes root: %s", rel)
+			}
+			break
+		}
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("resolve note path symlinks: %w", err)
+		}
+		parent := filepath.Dir(checkPath)
+		if parent == checkPath {
+			break
+		}
+		checkPath = parent
+	}
+	return absPath, nil
+}
+
+func ListNotesDir(root, relDir string) ([]NoteEntry, error) {
+	path, err := ResolveNotePath(root, relDir)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, fmt.Errorf("read notes directory: %w", err)
+	}
+	cleanDir, err := cleanRelativePath(relDir)
+	if err != nil {
+		return nil, err
+	}
+	notes := make([]NoteEntry, 0, len(entries))
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			return nil, fmt.Errorf("stat note entry %s: %w", entry.Name(), err)
+		}
+		rel := filepath.Join(cleanDir, entry.Name())
+		notes = append(notes, NoteEntry{
+			Name:    entry.Name(),
+			RelPath: rel,
+			IsDir:   entry.IsDir(),
+			Size:    info.Size(),
+		})
+	}
+	sort.Slice(notes, func(i, j int) bool {
+		if notes[i].IsDir != notes[j].IsDir {
+			return notes[i].IsDir
+		}
+		return strings.ToLower(notes[i].Name) < strings.ToLower(notes[j].Name)
+	})
+	return notes, nil
+}
+
+func safeChildPath(relDir, name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", fmt.Errorf("name cannot be empty")
+	}
+	if filepath.IsAbs(name) {
+		return "", fmt.Errorf("absolute paths are not allowed: %s", name)
+	}
+	cleanName, err := cleanRelativePath(name)
+	if err != nil {
+		return "", err
+	}
+	if cleanName == "" {
+		return "", fmt.Errorf("name cannot be empty or current directory")
+	}
+	cleanDir, err := cleanRelativePath(relDir)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(cleanDir, cleanName), nil
+}
+
+func markdownRelPath(relDir, name string) (string, error) {
+	rel, err := safeChildPath(relDir, name)
+	if err != nil {
+		return "", err
+	}
+	if filepath.Ext(rel) == "" {
+		rel += ".md"
+	}
+	return rel, nil
+}
+
+func CreateMarkdownNote(root, relDir, name string) (NoteEntry, error) {
+	rel, err := markdownRelPath(relDir, name)
+	if err != nil {
+		return NoteEntry{}, err
+	}
+	path, err := ResolveNotePath(root, rel)
+	if err != nil {
+		return NoteEntry{}, err
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		return NoteEntry{}, fmt.Errorf("create note: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return NoteEntry{}, fmt.Errorf("close note: %w", err)
+	}
+	return NoteEntry{Name: filepath.Base(rel), RelPath: rel, IsDir: false}, nil
+}
+
+func CreateNotesFolder(root, relDir, name string) (NoteEntry, error) {
+	rel, err := safeChildPath(relDir, name)
+	if err != nil {
+		return NoteEntry{}, err
+	}
+	path, err := ResolveNotePath(root, rel)
+	if err != nil {
+		return NoteEntry{}, err
+	}
+	if err := os.Mkdir(path, 0755); err != nil {
+		return NoteEntry{}, fmt.Errorf("create folder: %w", err)
+	}
+	return NoteEntry{Name: filepath.Base(rel), RelPath: rel, IsDir: true}, nil
+}
+
+func ReadNote(root, rel string) (string, error) {
+	path, err := ResolveNotePath(root, rel)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("stat note: %w", err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("cannot read folder as note: %s", rel)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read note: %w", err)
+	}
+	return string(data), nil
+}
+
+func NotesFolderNonEmpty(root, rel string) (bool, error) {
+	path, err := ResolveNotePath(root, rel)
+	if err != nil {
+		return false, err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return false, fmt.Errorf("open folder: %w", err)
+	}
+	defer file.Close()
+	_, err = file.Readdirnames(1)
+	if err == nil {
+		return true, nil
+	}
+	if err == io.EOF {
+		return false, nil
+	}
+	return false, fmt.Errorf("read folder: %w", err)
+}
+
+func DeleteNoteEntry(root, rel string) error {
+	path, err := ResolveNotePath(root, rel)
+	if err != nil {
+		return err
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Errorf("resolve notes root: %w", err)
+	}
+	if path == absRoot {
+		return fmt.Errorf("cannot delete notes root")
+	}
+	if err := os.RemoveAll(path); err != nil {
+		return fmt.Errorf("delete note entry: %w", err)
 	}
 	return nil
 }

@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
 	"wsl-task-buddy/store"
@@ -26,6 +28,16 @@ const (
 	modeConfirmDelete
 	modeHelp
 	modeTimeEdit
+	modeNoteCreate
+	modeNoteFolderCreate
+	modeNoteConfirmDelete
+)
+
+type appView int
+
+const (
+	viewTasks appView = iota
+	viewNotes
 )
 
 type model struct {
@@ -43,11 +55,21 @@ type model struct {
 	editTaskID    int
 	editCursor    int
 	activeContext string
+	view          appView
+
+	notesRoot           string
+	notesDir            string
+	noteEntries         []store.NoteEntry
+	noteCursor          int
+	notePreview         string
+	noteDeleteEntry     store.NoteEntry
+	noteDeleteRecursive bool
 }
 
 type reminderTickMsg time.Time
 type timerTickMsg time.Time
 type notifyDoneMsg struct{}
+type noteEditorDoneMsg struct{ err error }
 
 func reminderTickCmd() tea.Cmd {
 	return tea.Tick(30*time.Second, func(t time.Time) tea.Msg { return reminderTickMsg(t) })
@@ -181,19 +203,25 @@ func initialModel() model {
 	if err != nil {
 		return model{err: err.Error(), timerTaskID: -1, activeContext: store.TaskContextWork}
 	}
+	notesRoot, notesErr := store.NotesDir()
 	s, loadErr := store.Load(path)
 	today := time.Now().Format("2006-01-02")
 	if store.CarryForwardTasks(&s, today) {
 		if saveErr := store.Save(path, s); saveErr != nil {
-			return model{
+			m := model{
 				data:          s,
 				date:          time.Now(),
 				savePath:      path,
 				timerTaskID:   store.FindRunningTimerID(s),
 				lastChecked:   time.Now(),
 				activeContext: store.TaskContextWork,
+				notesRoot:     notesRoot,
 				err:           saveErr.Error(),
 			}
+			if notesErr == nil {
+				m.refreshNotes()
+			}
+			return m
 		}
 	}
 	m := model{
@@ -203,9 +231,15 @@ func initialModel() model {
 		timerTaskID:   store.FindRunningTimerID(s),
 		lastChecked:   time.Now(),
 		activeContext: store.TaskContextWork,
+		notesRoot:     notesRoot,
+	}
+	if notesErr == nil {
+		m.refreshNotes()
 	}
 	if loadErr != nil {
 		m.err = loadErr.Error()
+	} else if notesErr != nil {
+		m.err = notesErr.Error()
 	}
 	return m
 }
@@ -234,6 +268,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case notifyDoneMsg:
 		return m, nil
+	case noteEditorDoneMsg:
+		if msg.err != nil {
+			m.err = fmt.Sprintf("nvim: %v", msg.err)
+		}
+		m.refreshNotes()
+		return m, nil
 	case tea.KeyMsg:
 		m.err = ""
 		switch m.mode {
@@ -248,6 +288,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateConfirmDelete(msg)
 		case modeTimeEdit:
 			return m.updateTimeEdit(msg)
+		case modeNoteCreate:
+			return m.updateNoteCreate(msg)
+		case modeNoteFolderCreate:
+			return m.updateNoteFolderCreate(msg)
+		case modeNoteConfirmDelete:
+			return m.updateNoteConfirmDelete(msg)
 		default:
 			return m.updateNormal(msg)
 		}
@@ -256,6 +302,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.view == viewNotes {
+		return m.updateNotesNormal(msg)
+	}
+	return m.updateTasksNormal(msg)
+}
+
+func (m model) updateTasksNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	indices := m.tasksForDate()
 	switch msg.String() {
 	case "q", "ctrl+c":
@@ -303,10 +356,9 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.mode = modeConfirmDelete
 		}
 	case "n":
-		if len(indices) > 0 {
-			idx := indices[m.cursor]
-			return m, sendNotification("Task Reminder", m.data.Tasks[idx].Title)
-		}
+		m.view = viewNotes
+		m.mode = modeNormal
+		m.refreshNotes()
 	case "s":
 		if len(indices) > 0 {
 			globalIdx := indices[m.cursor]
@@ -335,6 +387,311 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "?":
 		m.mode = modeHelp
+	}
+	return m, nil
+}
+
+func (m *model) refreshNotes() {
+	if m.notesRoot == "" {
+		return
+	}
+	entries, err := store.ListNotesDir(m.notesRoot, m.notesDir)
+	if err != nil {
+		m.err = err.Error()
+		m.noteEntries = nil
+		m.notePreview = ""
+		return
+	}
+	m.noteEntries = entries
+	if m.noteCursor >= m.noteRowCount() {
+		m.noteCursor = m.noteRowCount() - 1
+	}
+	if m.noteCursor < 0 {
+		m.noteCursor = 0
+	}
+	m.refreshNotePreview()
+}
+
+func (m model) noteParentOffset() int {
+	if m.notesDir != "" {
+		return 1
+	}
+	return 0
+}
+
+func (m model) noteRowCount() int {
+	return len(m.noteEntries) + m.noteParentOffset()
+}
+
+func (m model) selectedNoteEntry() (store.NoteEntry, bool, bool) {
+	if m.notesDir != "" && m.noteCursor == 0 {
+		return store.NoteEntry{Name: "..", RelPath: filepath.Dir(m.notesDir), IsDir: true}, true, true
+	}
+	idx := m.noteCursor - m.noteParentOffset()
+	if idx < 0 || idx >= len(m.noteEntries) {
+		return store.NoteEntry{}, false, false
+	}
+	return m.noteEntries[idx], true, false
+}
+
+func (m *model) selectNotePath(rel string) {
+	offset := m.noteParentOffset()
+	for i, entry := range m.noteEntries {
+		if entry.RelPath == rel {
+			m.noteCursor = i + offset
+			return
+		}
+	}
+}
+
+func (m *model) refreshNotePreview() {
+	entry, ok, isParent := m.selectedNoteEntry()
+	if !ok {
+		m.notePreview = helpStyle.Render("No notes yet. Press a to create a Markdown note or A to create a folder.")
+		return
+	}
+	if isParent {
+		m.notePreview = helpStyle.Render("Parent directory\n\nPress enter or h to go up.")
+		return
+	}
+	if entry.IsDir {
+		m.notePreview = helpStyle.Render(fmt.Sprintf("Folder: %s\n\nPress enter/l to open.\nPress d/x to delete.", entry.Name))
+		return
+	}
+	if strings.ToLower(filepath.Ext(entry.Name)) != ".md" {
+		m.notePreview = helpStyle.Render(fmt.Sprintf("Unsupported preview for %s\n\nPress enter/l to edit in nvim.", entry.Name))
+		return
+	}
+	content, err := store.ReadNote(m.notesRoot, entry.RelPath)
+	if err != nil {
+		m.notePreview = errStyle.Render(err.Error())
+		return
+	}
+	if strings.TrimSpace(content) == "" {
+		m.notePreview = helpStyle.Render("Empty note. Press enter/l to edit in nvim.")
+		return
+	}
+	wrap := m.width - 42
+	if wrap < 30 {
+		wrap = 80
+	}
+	renderer, err := glamour.NewTermRenderer(glamour.WithAutoStyle(), glamour.WithWordWrap(wrap))
+	if err != nil {
+		m.notePreview = content
+		return
+	}
+	rendered, err := renderer.Render(content)
+	if err != nil {
+		m.notePreview = content
+		return
+	}
+	m.notePreview = strings.TrimRight(rendered, "\n")
+}
+
+func (m model) updateNotesNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "ctrl+c":
+		if m.timerTaskID >= 0 {
+			m.stopTimer()
+			m.save()
+		}
+		return m, tea.Quit
+	case "n":
+		m.view = viewTasks
+		m.mode = modeNormal
+		return m, nil
+	case "j", "down":
+		if m.noteRowCount() > 0 && m.noteCursor < m.noteRowCount()-1 {
+			m.noteCursor++
+			m.refreshNotePreview()
+		}
+	case "k", "up":
+		if m.noteCursor > 0 {
+			m.noteCursor--
+			m.refreshNotePreview()
+		}
+	case "g":
+		m.noteCursor = 0
+		m.refreshNotePreview()
+	case "G":
+		if m.noteRowCount() > 0 {
+			m.noteCursor = m.noteRowCount() - 1
+			m.refreshNotePreview()
+		}
+	case "h", "backspace", "left":
+		m.goNotesParent()
+	case "enter", "l", "right":
+		return m.openSelectedNoteEntry()
+	case "a":
+		m.mode = modeNoteCreate
+		m.input = ""
+	case "A":
+		m.mode = modeNoteFolderCreate
+		m.input = ""
+	case "d", "x":
+		entry, ok, isParent := m.selectedNoteEntry()
+		if ok && !isParent {
+			m.noteDeleteEntry = entry
+			m.noteDeleteRecursive = false
+			if entry.IsDir {
+				nonEmpty, err := store.NotesFolderNonEmpty(m.notesRoot, entry.RelPath)
+				if err != nil {
+					m.err = err.Error()
+					return m, nil
+				}
+				m.noteDeleteRecursive = nonEmpty
+			}
+			m.mode = modeNoteConfirmDelete
+		}
+	case "r":
+		m.refreshNotes()
+	case "?":
+		m.mode = modeHelp
+	}
+	return m, nil
+}
+
+func (m *model) goNotesParent() {
+	if m.notesDir == "" {
+		return
+	}
+	m.notesDir = filepath.Dir(m.notesDir)
+	if m.notesDir == "." {
+		m.notesDir = ""
+	}
+	m.noteCursor = 0
+	m.refreshNotes()
+}
+
+func (m model) openSelectedNoteEntry() (tea.Model, tea.Cmd) {
+	entry, ok, isParent := m.selectedNoteEntry()
+	if !ok {
+		return m, nil
+	}
+	if isParent {
+		m.goNotesParent()
+		return m, nil
+	}
+	if entry.IsDir {
+		m.notesDir = entry.RelPath
+		m.noteCursor = 0
+		m.refreshNotes()
+		return m, nil
+	}
+	return m.openNoteEditor(entry.RelPath)
+}
+
+func (m model) openNoteEditor(rel string) (model, tea.Cmd) {
+	path, err := store.ResolveNotePath(m.notesRoot, rel)
+	if err != nil {
+		m.err = err.Error()
+		return m, nil
+	}
+	if _, err := exec.LookPath("nvim"); err != nil {
+		m.err = "nvim not found; install Neovim to edit notes"
+		return m, nil
+	}
+	cmd := exec.Command("nvim", path)
+	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+		return noteEditorDoneMsg{err: err}
+	})
+}
+
+func (m model) updateNoteCreate(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		if m.timerTaskID >= 0 {
+			m.stopTimer()
+			m.save()
+		}
+		return m, tea.Quit
+	case "enter":
+		name := strings.TrimSpace(m.input)
+		m.mode = modeNormal
+		m.input = ""
+		if name == "" {
+			return m, nil
+		}
+		entry, err := store.CreateMarkdownNote(m.notesRoot, m.notesDir, name)
+		if err != nil {
+			m.err = err.Error()
+			return m, nil
+		}
+		m.refreshNotes()
+		m.selectNotePath(entry.RelPath)
+		m.refreshNotePreview()
+		return m.openNoteEditor(entry.RelPath)
+	case "esc":
+		m.mode = modeNormal
+		m.input = ""
+	case "backspace":
+		if len(m.input) > 0 {
+			_, size := utf8.DecodeLastRuneInString(m.input)
+			m.input = m.input[:len(m.input)-size]
+		}
+	default:
+		if utf8.RuneCountInString(msg.String()) == 1 {
+			m.input += msg.String()
+		}
+	}
+	return m, nil
+}
+
+func (m model) updateNoteFolderCreate(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		if m.timerTaskID >= 0 {
+			m.stopTimer()
+			m.save()
+		}
+		return m, tea.Quit
+	case "enter":
+		name := strings.TrimSpace(m.input)
+		m.mode = modeNormal
+		m.input = ""
+		if name == "" {
+			return m, nil
+		}
+		entry, err := store.CreateNotesFolder(m.notesRoot, m.notesDir, name)
+		if err != nil {
+			m.err = err.Error()
+			return m, nil
+		}
+		m.refreshNotes()
+		m.selectNotePath(entry.RelPath)
+		m.refreshNotePreview()
+	case "esc":
+		m.mode = modeNormal
+		m.input = ""
+	case "backspace":
+		if len(m.input) > 0 {
+			_, size := utf8.DecodeLastRuneInString(m.input)
+			m.input = m.input[:len(m.input)-size]
+		}
+	default:
+		if utf8.RuneCountInString(msg.String()) == 1 {
+			m.input += msg.String()
+		}
+	}
+	return m, nil
+}
+
+func (m model) updateNoteConfirmDelete(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		if m.timerTaskID >= 0 {
+			m.stopTimer()
+			m.save()
+		}
+		return m, tea.Quit
+	case "y":
+		if err := store.DeleteNoteEntry(m.notesRoot, m.noteDeleteEntry.RelPath); err != nil {
+			m.err = err.Error()
+		}
+		m.mode = modeNormal
+		m.refreshNotes()
+	default:
+		m.mode = modeNormal
 	}
 	return m, nil
 }
@@ -591,6 +948,13 @@ func displayWidth(s string) int {
 }
 
 func (m model) View() string {
+	if m.view == viewNotes {
+		return m.notesView()
+	}
+	return m.tasksView()
+}
+
+func (m model) tasksView() string {
 	var b strings.Builder
 	w := m.width
 	if w < 1 {
@@ -761,8 +1125,8 @@ func (m model) View() string {
 			"s       start/stop timer",
 			"T       add time manually",
 			"p       toggle work/personal list",
+			"n       switch to notes",
 			"d/x     delete task",
-			"n       send notification",
 			"j/k     move up/down",
 			"g/G     jump to top/bottom",
 			"h/l     previous/next day",
@@ -799,9 +1163,171 @@ func (m model) View() string {
 
 	b.WriteString(centerText(selectedStyle.Render("["+strings.ToUpper(contextName)+"]"), w))
 	b.WriteString("\n")
-	b.WriteString(centerText(helpStyle.Render(fmt.Sprintf("? help  p %s  q quit", nextContext)), w))
+	b.WriteString(centerText(helpStyle.Render(fmt.Sprintf("? help  n notes  p %s  q quit", nextContext)), w))
 	b.WriteString("\n")
 
+	return b.String()
+}
+
+func padOrTrim(text string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if lipgloss.Width(text) <= width {
+		return text + strings.Repeat(" ", width-lipgloss.Width(text))
+	}
+	runes := []rune(text)
+	for len(runes) > 0 && lipgloss.Width(string(runes)+"…") > width {
+		runes = runes[:len(runes)-1]
+	}
+	return string(runes) + "…"
+}
+
+func (m model) notesHelpText() string {
+	lines := []string{
+		"Notes keybindings",
+		"",
+		"n             switch to tasks",
+		"j/k           move up/down",
+		"g/G           top/bottom",
+		"enter/l       enter folder or edit note",
+		"h/backspace   parent folder",
+		"a             create Markdown note",
+		"A             create folder",
+		"d/x           delete file/folder",
+		"r             refresh",
+		"[up]/[dir]/[md]/[file] are parent/folder/Markdown/other file",
+		"?             toggle this help",
+		"q             quit",
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m model) notesView() string {
+	var b strings.Builder
+	w := m.width
+	if w < 1 {
+		w = 100
+	}
+	h := m.height
+	if h < 10 {
+		h = 24
+	}
+
+	current := "/"
+	if m.notesDir != "" {
+		current = "/" + filepath.ToSlash(m.notesDir)
+	}
+	b.WriteString("\n")
+	b.WriteString(centerText(todayStyle.Render("Notes ")+dateStyle.Render(current), w))
+	b.WriteString("\n")
+	if m.notesRoot != "" {
+		b.WriteString(centerText(helpStyle.Render(m.notesRoot), w))
+		b.WriteString("\n")
+	}
+	dividerLen := min(w-4, 90)
+	if dividerLen < 1 {
+		dividerLen = 40
+	}
+	b.WriteString(centerText(helpStyle.Render(strings.Repeat("─", dividerLen)), w))
+	b.WriteString("\n\n")
+
+	listWidth := w / 3
+	if listWidth < 24 {
+		listWidth = 24
+	}
+	if listWidth > 42 {
+		listWidth = 42
+	}
+	previewWidth := w - listWidth - 5
+	if previewWidth < 20 {
+		previewWidth = 20
+	}
+	// Reserve fixed space below the panes for prompts/errors so entering a
+	// confirmation or create mode doesn't push the layout around.
+	maxRows := h - 11
+	if maxRows < 5 {
+		maxRows = 5
+	}
+
+	var rows []string
+	if m.notesDir != "" {
+		rows = append(rows, "[up] ../")
+	}
+	for _, entry := range m.noteEntries {
+		prefix := "[file]"
+		name := entry.Name
+		if entry.IsDir {
+			prefix = "[dir]"
+			name += "/"
+		} else if strings.ToLower(filepath.Ext(entry.Name)) == ".md" {
+			prefix = "[md]"
+		}
+		rows = append(rows, fmt.Sprintf("%s %s", prefix, name))
+	}
+	if len(rows) == 0 {
+		rows = append(rows, helpStyle.Render("empty — press a or A"))
+	}
+
+	preview := m.notePreview
+	if m.mode == modeHelp {
+		preview = helpStyle.Render(m.notesHelpText())
+	}
+	previewLines := strings.Split(preview, "\n")
+	if len(previewLines) == 0 {
+		previewLines = []string{""}
+	}
+
+	for i := 0; i < maxRows; i++ {
+		left := ""
+		if i < len(rows) {
+			line := rows[i]
+			if i == m.noteCursor && m.noteRowCount() > 0 {
+				line = selectedStyle.Render("> " + line)
+			} else {
+				line = "  " + line
+			}
+			left = padOrTrim(line, listWidth)
+		} else {
+			left = strings.Repeat(" ", listWidth)
+		}
+		right := ""
+		if i < len(previewLines) {
+			right = previewLines[i]
+		}
+		b.WriteString(left)
+		b.WriteString(helpStyle.Render(" │ "))
+		b.WriteString(padOrTrim(right, previewWidth))
+		b.WriteString("\n")
+	}
+
+	statusLine := ""
+	if m.err != "" {
+		statusLine = errStyle.Render("error: " + m.err)
+	} else if m.mode == modeNoteCreate {
+		statusLine = inputStyle.Render(fmt.Sprintf("new markdown note: %s_", m.input))
+	} else if m.mode == modeNoteFolderCreate {
+		statusLine = inputStyle.Render(fmt.Sprintf("new folder: %s_", m.input))
+	} else if m.mode == modeNoteConfirmDelete {
+		if m.noteDeleteRecursive {
+			statusLine = warnStyle.Render(fmt.Sprintf("RECURSIVELY delete non-empty folder %q and everything inside? (y/n)", m.noteDeleteEntry.Name))
+		} else {
+			statusLine = warnStyle.Render(fmt.Sprintf("delete %q? (y/n)", m.noteDeleteEntry.Name))
+		}
+	}
+	b.WriteString("\n")
+	b.WriteString(centerText(statusLine, w))
+	b.WriteString("\n")
+
+	contentLines := strings.Count(b.String(), "\n")
+	padding := h - contentLines - 3
+	if padding > 0 {
+		b.WriteString(strings.Repeat("\n", padding))
+	}
+	b.WriteString(centerText(selectedStyle.Render("[NOTES]"), w))
+	b.WriteString("\n")
+	b.WriteString(centerText(helpStyle.Render("? help  n tasks  a note  A folder  d delete  [dir] folder [md] note"), w))
+	b.WriteString("\n")
 	return b.String()
 }
 

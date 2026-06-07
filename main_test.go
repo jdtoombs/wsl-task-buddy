@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"wsl-task-buddy/store"
 )
 
@@ -94,5 +95,43 @@ func TestParseDurationInput(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("parseDurationInput(%q) = %v, want %v", tt.input, got, tt.want)
 		}
+	}
+}
+
+func TestToggleNotesViewWithN(t *testing.T) {
+	root := t.TempDir()
+	m := model{view: viewTasks, notesRoot: root, activeContext: store.TaskContextWork}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = updated.(model)
+	if m.view != viewNotes {
+		t.Fatalf("expected notes view, got %v", m.view)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = updated.(model)
+	if m.view != viewTasks {
+		t.Fatalf("expected tasks view, got %v", m.view)
+	}
+}
+
+func TestNotesDeleteDetectsNonEmptyFolder(t *testing.T) {
+	root := t.TempDir()
+	if _, err := store.CreateNotesFolder(root, "", "folder"); err != nil {
+		t.Fatalf("create folder: %v", err)
+	}
+	if _, err := store.CreateMarkdownNote(root, "folder", "note"); err != nil {
+		t.Fatalf("create nested note: %v", err)
+	}
+	m := model{view: viewNotes, notesRoot: root, mode: modeNormal, activeContext: store.TaskContextWork}
+	m.refreshNotes()
+	if len(m.noteEntries) != 1 || !m.noteEntries[0].IsDir {
+		t.Fatalf("expected one folder entry, got %+v", m.noteEntries)
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(model)
+	if m.mode != modeNoteConfirmDelete {
+		t.Fatalf("expected note delete confirmation mode, got %v", m.mode)
+	}
+	if !m.noteDeleteRecursive {
+		t.Fatal("expected recursive delete warning for non-empty folder")
 	}
 }

@@ -454,3 +454,138 @@ func TestCarryForwardSkipsFutureDates(t *testing.T) {
 		t.Error("should not carry future tasks")
 	}
 }
+
+func TestNotesDirDefaultCreatesDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv(NotesDirEnv, "")
+	got, err := NotesDir()
+	if err != nil {
+		t.Fatalf("NotesDir error: %v", err)
+	}
+	want := filepath.Join(home, ".task-buddy", "notes")
+	if got != want {
+		t.Fatalf("NotesDir = %q, want %q", got, want)
+	}
+	info, err := os.Stat(got)
+	if err != nil {
+		t.Fatalf("notes dir was not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("notes path is not a directory")
+	}
+}
+
+func TestNotesDirEnvOverrideCreatesDirectory(t *testing.T) {
+	custom := filepath.Join(t.TempDir(), "custom-notes")
+	t.Setenv(NotesDirEnv, custom)
+	got, err := NotesDir()
+	if err != nil {
+		t.Fatalf("NotesDir error: %v", err)
+	}
+	if got != custom {
+		t.Fatalf("NotesDir = %q, want %q", got, custom)
+	}
+	if info, err := os.Stat(got); err != nil || !info.IsDir() {
+		t.Fatalf("override directory was not created: info=%v err=%v", info, err)
+	}
+}
+
+func TestResolveNotePathBlocksEscapes(t *testing.T) {
+	root := t.TempDir()
+	if _, err := ResolveNotePath(root, "../escape.md"); err == nil {
+		t.Fatal("expected parent traversal to be rejected")
+	}
+	if _, err := ResolveNotePath(root, filepath.Join("..", "escape.md")); err == nil {
+		t.Fatal("expected filepath parent traversal to be rejected")
+	}
+	if _, err := ResolveNotePath(root, filepath.Join("folder", "note.md")); err != nil {
+		t.Fatalf("expected safe relative path, got %v", err)
+	}
+}
+
+func TestCreateMarkdownNoteDefaultsExtensionAndRead(t *testing.T) {
+	root := t.TempDir()
+	entry, err := CreateMarkdownNote(root, "", "daily")
+	if err != nil {
+		t.Fatalf("CreateMarkdownNote error: %v", err)
+	}
+	if entry.Name != "daily.md" || entry.RelPath != "daily.md" {
+		t.Fatalf("unexpected entry: %+v", entry)
+	}
+	path, err := ResolveNotePath(root, entry.RelPath)
+	if err != nil {
+		t.Fatalf("ResolveNotePath error: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("# Daily"), 0644); err != nil {
+		t.Fatalf("write note: %v", err)
+	}
+	content, err := ReadNote(root, entry.RelPath)
+	if err != nil {
+		t.Fatalf("ReadNote error: %v", err)
+	}
+	if content != "# Daily" {
+		t.Fatalf("ReadNote = %q", content)
+	}
+}
+
+func TestListNotesDirSortsFoldersFirst(t *testing.T) {
+	root := t.TempDir()
+	if _, err := CreateMarkdownNote(root, "", "zeta"); err != nil {
+		t.Fatalf("create note: %v", err)
+	}
+	if _, err := CreateNotesFolder(root, "", "alpha"); err != nil {
+		t.Fatalf("create folder: %v", err)
+	}
+	entries, err := ListNotesDir(root, "")
+	if err != nil {
+		t.Fatalf("ListNotesDir error: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	if !entries[0].IsDir || entries[0].Name != "alpha" {
+		t.Fatalf("expected folder first, got %+v", entries[0])
+	}
+	if entries[1].IsDir || entries[1].Name != "zeta.md" {
+		t.Fatalf("expected file second, got %+v", entries[1])
+	}
+}
+
+func TestNotesFolderNonEmptyAndRecursiveDelete(t *testing.T) {
+	root := t.TempDir()
+	if _, err := CreateNotesFolder(root, "", "folder"); err != nil {
+		t.Fatalf("create folder: %v", err)
+	}
+	nonEmpty, err := NotesFolderNonEmpty(root, "folder")
+	if err != nil {
+		t.Fatalf("NotesFolderNonEmpty error: %v", err)
+	}
+	if nonEmpty {
+		t.Fatal("new folder should be empty")
+	}
+	if _, err := CreateMarkdownNote(root, "folder", "note"); err != nil {
+		t.Fatalf("create nested note: %v", err)
+	}
+	nonEmpty, err = NotesFolderNonEmpty(root, "folder")
+	if err != nil {
+		t.Fatalf("NotesFolderNonEmpty error: %v", err)
+	}
+	if !nonEmpty {
+		t.Fatal("folder with note should be non-empty")
+	}
+	if err := DeleteNoteEntry(root, "folder"); err != nil {
+		t.Fatalf("DeleteNoteEntry error: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "folder")); !os.IsNotExist(err) {
+		t.Fatalf("expected folder to be removed, err=%v", err)
+	}
+}
+
+func TestDeleteNoteEntryRejectsRoot(t *testing.T) {
+	root := t.TempDir()
+	if err := DeleteNoteEntry(root, ""); err == nil {
+		t.Fatal("expected deleting notes root to be rejected")
+	}
+}
