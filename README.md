@@ -24,11 +24,12 @@ Or run directly without building:
 go run .
 ```
 
-Tasks are stored in `~/.tasks.json`. Incomplete tasks from past dates are automatically carried forward to today on launch.
+Tasks are stored in `~/.tasks.json`. The app starts in the work list; existing tasks without a saved list are treated as personal. Incomplete tasks from past dates are automatically carried forward to today on launch.
 
 ## Features
 
 - Vim-style navigation with date-based task filtering
+- Separate work and personal task lists, toggled with `p`
 - Timer tracking with start/stop per task
 - Manual time entry (e.g. `1h30m`, `45m`, `1:30`)
 - Carry-forward of incomplete past tasks to today
@@ -47,6 +48,7 @@ Tasks are stored in `~/.tasks.json`. Incomplete tasks from past dates are automa
 | `enter` / `space` | Toggle done |
 | `s` | Start/stop timer |
 | `T` | Add time manually |
+| `p` | Toggle work/personal list |
 | `d` / `x` | Delete task (with confirmation) |
 | `n` | Send notification for selected task |
 | `?` | Toggle help overlay |

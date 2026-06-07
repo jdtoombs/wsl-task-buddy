@@ -94,6 +94,17 @@ func TestAddTask(t *testing.T) {
 	if data.Tasks[0].Title != "my task" {
 		t.Errorf("expected 'my task', got %q", data.Tasks[0].Title)
 	}
+	if data.Tasks[0].Context != TaskContextPersonal {
+		t.Errorf("expected default context %q, got %q", TaskContextPersonal, data.Tasks[0].Context)
+	}
+}
+
+func TestAddTaskWithContext(t *testing.T) {
+	data := TaskData{NextID: 1}
+	task := AddTask(&data, "work task", "2025-03-01", TaskContextWork)
+	if task.Context != TaskContextWork {
+		t.Errorf("expected context %q, got %q", TaskContextWork, task.Context)
+	}
 }
 
 func TestToggleDone(t *testing.T) {
@@ -217,6 +228,46 @@ func TestTasksForDate(t *testing.T) {
 	tasks := TasksForDate(data, "2025-01-01")
 	if len(tasks) != 2 {
 		t.Fatalf("expected 2 tasks, got %d", len(tasks))
+	}
+}
+
+func TestNormalizeTaskContext(t *testing.T) {
+	tests := []struct {
+		context string
+		want    string
+	}{
+		{"", TaskContextPersonal},
+		{"personal", TaskContextPersonal},
+		{"PERSONAL", TaskContextPersonal},
+		{"work", TaskContextWork},
+		{" Work ", TaskContextWork},
+		{"other", TaskContextPersonal},
+	}
+	for _, tt := range tests {
+		if got := NormalizeTaskContext(tt.context); got != tt.want {
+			t.Errorf("NormalizeTaskContext(%q) = %q, want %q", tt.context, got, tt.want)
+		}
+	}
+}
+
+func TestTasksForDateAndContext(t *testing.T) {
+	data := TaskData{NextID: 5, Tasks: []Task{
+		{ID: 1, Title: "legacy personal", Date: "2025-01-01"},
+		{ID: 2, Title: "personal", Date: "2025-01-01", Context: TaskContextPersonal},
+		{ID: 3, Title: "work", Date: "2025-01-01", Context: TaskContextWork},
+		{ID: 4, Title: "tomorrow", Date: "2025-01-02", Context: TaskContextWork},
+	}}
+
+	personalTasks := TasksForDateAndContext(data, "2025-01-01", TaskContextPersonal)
+	if len(personalTasks) != 2 {
+		t.Fatalf("expected 2 personal tasks, got %d", len(personalTasks))
+	}
+	workTasks := TasksForDateAndContext(data, "2025-01-01", TaskContextWork)
+	if len(workTasks) != 1 {
+		t.Fatalf("expected 1 work task, got %d", len(workTasks))
+	}
+	if workTasks[0].Title != "work" {
+		t.Errorf("expected work task, got %q", workTasks[0].Title)
 	}
 }
 
@@ -344,6 +395,53 @@ func TestCarryForwardNoDuplicateByID(t *testing.T) {
 	}
 	if len(data.Tasks) != 2 {
 		t.Errorf("expected 2 tasks, got %d", len(data.Tasks))
+	}
+}
+
+func TestCarryForwardDeduplicatesByTitle(t *testing.T) {
+	// Same task manually re-entered on two different past dates (no CarriedFromID).
+	// Only one copy should be carried to today.
+	data := TaskData{NextID: 4, Tasks: []Task{
+		{ID: 1, Title: "Bug Fix", Date: "2025-01-01", Done: false},
+		{ID: 2, Title: "Bug Fix", Date: "2025-01-02", Done: false},
+		{ID: 3, Title: "Other Task", Date: "2025-01-02", Done: false},
+	}}
+	changed := CarryForwardTasks(&data, "2025-01-05")
+	if !changed {
+		t.Fatal("expected changes")
+	}
+	todayTasks := TasksForDate(data, "2025-01-05")
+	if len(todayTasks) != 2 {
+		t.Errorf("expected 2 tasks on today (Bug Fix + Other Task), got %d", len(todayTasks))
+	}
+	// Both originals should be marked done
+	if !data.Tasks[0].Done || !data.Tasks[1].Done {
+		t.Error("both originals should be marked done")
+	}
+}
+
+func TestCarryForwardDeduplicatesByTitleWithinContext(t *testing.T) {
+	data := TaskData{NextID: 3, Tasks: []Task{
+		{ID: 1, Title: "Same Title", Date: "2025-01-01", Done: false, Context: TaskContextPersonal},
+		{ID: 2, Title: "Same Title", Date: "2025-01-01", Done: false, Context: TaskContextWork},
+	}}
+	changed := CarryForwardTasks(&data, "2025-01-05")
+	if !changed {
+		t.Fatal("expected changes")
+	}
+	personalTasks := TasksForDateAndContext(data, "2025-01-05", TaskContextPersonal)
+	if len(personalTasks) != 1 {
+		t.Fatalf("expected 1 personal carried task, got %d", len(personalTasks))
+	}
+	workTasks := TasksForDateAndContext(data, "2025-01-05", TaskContextWork)
+	if len(workTasks) != 1 {
+		t.Fatalf("expected 1 work carried task, got %d", len(workTasks))
+	}
+	if personalTasks[0].Context != TaskContextPersonal {
+		t.Errorf("expected personal context, got %q", personalTasks[0].Context)
+	}
+	if workTasks[0].Context != TaskContextWork {
+		t.Errorf("expected work context, got %q", workTasks[0].Context)
 	}
 }
 

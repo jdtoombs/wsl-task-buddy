@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -14,14 +15,29 @@ type TimeEntry struct {
 	End   *time.Time `json:"end,omitempty"`
 }
 
+const (
+	TaskContextPersonal = "personal"
+	TaskContextWork     = "work"
+)
+
+func NormalizeTaskContext(context string) string {
+	switch strings.ToLower(strings.TrimSpace(context)) {
+	case TaskContextWork:
+		return TaskContextWork
+	default:
+		return TaskContextPersonal
+	}
+}
+
 type Task struct {
-	ID             int         `json:"id"`
-	Title          string      `json:"title"`
-	Done           bool        `json:"done"`
-	Date           string      `json:"date"`
-	Notified       bool        `json:"notified,omitempty"`
-	Entries        []TimeEntry `json:"entries,omitempty"`
-	CarriedFromID  int         `json:"carried_from_id,omitempty"`
+	ID            int         `json:"id"`
+	Title         string      `json:"title"`
+	Done          bool        `json:"done"`
+	Date          string      `json:"date"`
+	Context       string      `json:"context,omitempty"`
+	Notified      bool        `json:"notified,omitempty"`
+	Entries       []TimeEntry `json:"entries,omitempty"`
+	CarriedFromID int         `json:"carried_from_id,omitempty"`
 }
 
 func (t Task) TotalTime() time.Duration {
@@ -110,6 +126,17 @@ func TasksForDate(s TaskData, date string) []Task {
 	return tasks
 }
 
+func TasksForDateAndContext(s TaskData, date, context string) []Task {
+	context = NormalizeTaskContext(context)
+	var tasks []Task
+	for _, t := range s.Tasks {
+		if t.Date == date && NormalizeTaskContext(t.Context) == context {
+			tasks = append(tasks, t)
+		}
+	}
+	return tasks
+}
+
 func TaskByID(s TaskData, id int) (Task, int, bool) {
 	for i, t := range s.Tasks {
 		if t.ID == id {
@@ -119,11 +146,16 @@ func TaskByID(s TaskData, id int) (Task, int, bool) {
 	return Task{}, -1, false
 }
 
-func AddTask(s *TaskData, title, date string) Task {
+func AddTask(s *TaskData, title, date string, context ...string) Task {
+	taskContext := TaskContextPersonal
+	if len(context) > 0 {
+		taskContext = NormalizeTaskContext(context[0])
+	}
 	t := Task{
-		ID:    s.NextID,
-		Title: title,
-		Date:  date,
+		ID:      s.NextID,
+		Title:   title,
+		Date:    date,
+		Context: taskContext,
 	}
 	s.NextID++
 	s.Tasks = append(s.Tasks, t)
@@ -195,11 +227,21 @@ func FindRunningTimerID(s TaskData) int {
 // marking the originals as done so they won't be carried again.
 // Uses CarriedFromID to track origin, avoiding duplicates even after renames.
 func CarryForwardTasks(s *TaskData, today string) bool {
-	// Build set of source IDs already carried into today
+	// Build set of source IDs and titles already on today to prevent duplicates.
+	// Titles dedupe only within the same task context, so work and personal lists
+	// can each carry a task with the same title.
 	carriedIDs := make(map[int]bool)
+	todayTitles := make(map[string]map[string]bool)
 	for _, t := range s.Tasks {
-		if t.Date == today && t.CarriedFromID > 0 {
-			carriedIDs[t.CarriedFromID] = true
+		if t.Date == today {
+			context := NormalizeTaskContext(t.Context)
+			if todayTitles[context] == nil {
+				todayTitles[context] = make(map[string]bool)
+			}
+			todayTitles[context][t.Title] = true
+			if t.CarriedFromID > 0 {
+				carriedIDs[t.CarriedFromID] = true
+			}
 		}
 	}
 	changed := false
@@ -208,13 +250,21 @@ func CarryForwardTasks(s *TaskData, today string) bool {
 		if t.Date >= today || t.Done {
 			continue
 		}
-		if carriedIDs[t.ID] {
+		context := NormalizeTaskContext(t.Context)
+		if todayTitles[context] == nil {
+			todayTitles[context] = make(map[string]bool)
+		}
+		if carriedIDs[t.ID] || todayTitles[context][t.Title] {
+			// Still mark the original as done to prevent future carries
+			s.Tasks[i].Done = true
+			changed = true
 			continue
 		}
 		newTask := Task{
 			ID:            s.NextID,
 			Title:         t.Title,
 			Date:          today,
+			Context:       context,
 			CarriedFromID: t.ID,
 		}
 		s.NextID++
@@ -222,6 +272,7 @@ func CarryForwardTasks(s *TaskData, today string) bool {
 		// Mark original as done so it won't be carried again
 		s.Tasks[i].Done = true
 		carriedIDs[t.ID] = true
+		todayTitles[context][t.Title] = true
 		changed = true
 	}
 	return changed

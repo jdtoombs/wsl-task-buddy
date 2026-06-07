@@ -3,7 +3,48 @@ package main
 import (
 	"testing"
 	"time"
+
+	"wsl-task-buddy/store"
 )
+
+func TestToggleContext(t *testing.T) {
+	m := model{activeContext: store.TaskContextWork, cursor: 3}
+	m.toggleContext()
+	if m.currentContext() != store.TaskContextPersonal {
+		t.Fatalf("expected personal context, got %q", m.currentContext())
+	}
+	if m.cursor != 0 {
+		t.Errorf("expected cursor reset to 0, got %d", m.cursor)
+	}
+	m.toggleContext()
+	if m.currentContext() != store.TaskContextWork {
+		t.Fatalf("expected work context, got %q", m.currentContext())
+	}
+}
+
+func TestModelTasksForDateFiltersByContext(t *testing.T) {
+	date := time.Date(2025, 1, 1, 0, 0, 0, 0, time.Local)
+	m := model{
+		date:          date,
+		activeContext: store.TaskContextPersonal,
+		data: store.TaskData{Tasks: []store.Task{
+			{ID: 1, Title: "legacy personal", Date: "2025-01-01"},
+			{ID: 2, Title: "personal", Date: "2025-01-01", Context: store.TaskContextPersonal},
+			{ID: 3, Title: "work", Date: "2025-01-01", Context: store.TaskContextWork},
+		}},
+	}
+	if indices := m.tasksForDate(); len(indices) != 2 {
+		t.Fatalf("expected 2 personal tasks, got %d", len(indices))
+	}
+	m.activeContext = store.TaskContextWork
+	indices := m.tasksForDate()
+	if len(indices) != 1 {
+		t.Fatalf("expected 1 work task, got %d", len(indices))
+	}
+	if m.data.Tasks[indices[0]].Title != "work" {
+		t.Errorf("expected work task, got %q", m.data.Tasks[indices[0]].Title)
+	}
+}
 
 func TestParseDurationInput(t *testing.T) {
 	tests := []struct {

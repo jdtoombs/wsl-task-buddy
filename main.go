@@ -2,9 +2,9 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"context"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -29,19 +29,20 @@ const (
 )
 
 type model struct {
-	data        store.TaskData
-	cursor      int
-	mode        mode
-	input       string
-	date        time.Time
-	width       int
-	height      int
-	savePath    string
-	err         string
-	timerTaskID int
-	lastChecked time.Time
-	editTaskID  int
-	editCursor  int
+	data          store.TaskData
+	cursor        int
+	mode          mode
+	input         string
+	date          time.Time
+	width         int
+	height        int
+	savePath      string
+	err           string
+	timerTaskID   int
+	lastChecked   time.Time
+	editTaskID    int
+	editCursor    int
+	activeContext string
 }
 
 type reminderTickMsg time.Time
@@ -96,11 +97,28 @@ func sendNotification(title, body string) tea.Cmd {
 	}
 }
 
+func (m model) currentContext() string {
+	return store.NormalizeTaskContext(m.activeContext)
+}
+
+func (m model) nextContext() string {
+	if m.currentContext() == store.TaskContextWork {
+		return store.TaskContextPersonal
+	}
+	return store.TaskContextWork
+}
+
+func (m *model) toggleContext() {
+	m.activeContext = m.nextContext()
+	m.cursor = 0
+}
+
 func (m model) tasksForDate() []int {
 	dateStr := m.date.Format("2006-01-02")
+	context := m.currentContext()
 	var indices []int
 	for i, t := range m.data.Tasks {
-		if t.Date == dateStr {
+		if t.Date == dateStr && store.NormalizeTaskContext(t.Context) == context {
 			indices = append(indices, i)
 		}
 	}
@@ -161,28 +179,30 @@ func (m *model) checkReminders() tea.Cmd {
 func initialModel() model {
 	path, err := store.DataPath()
 	if err != nil {
-		return model{err: err.Error(), timerTaskID: -1}
+		return model{err: err.Error(), timerTaskID: -1, activeContext: store.TaskContextWork}
 	}
 	s, loadErr := store.Load(path)
 	today := time.Now().Format("2006-01-02")
 	if store.CarryForwardTasks(&s, today) {
 		if saveErr := store.Save(path, s); saveErr != nil {
 			return model{
-				data:        s,
-				date:        time.Now(),
-				savePath:    path,
-				timerTaskID: store.FindRunningTimerID(s),
-				lastChecked: time.Now(),
-				err:         saveErr.Error(),
+				data:          s,
+				date:          time.Now(),
+				savePath:      path,
+				timerTaskID:   store.FindRunningTimerID(s),
+				lastChecked:   time.Now(),
+				activeContext: store.TaskContextWork,
+				err:           saveErr.Error(),
 			}
 		}
 	}
 	m := model{
-		data:        s,
-		date:        time.Now(),
-		savePath:    path,
-		timerTaskID: store.FindRunningTimerID(s),
-		lastChecked: time.Now(),
+		data:          s,
+		date:          time.Now(),
+		savePath:      path,
+		timerTaskID:   store.FindRunningTimerID(s),
+		lastChecked:   time.Now(),
+		activeContext: store.TaskContextWork,
 	}
 	if loadErr != nil {
 		m.err = loadErr.Error()
@@ -270,6 +290,8 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "t":
 		m.date = time.Now()
 		m.cursor = 0
+	case "p":
+		m.toggleContext()
 	case "enter", " ":
 		if len(indices) > 0 {
 			idx := indices[m.cursor]
@@ -356,7 +378,7 @@ func (m model) updateInsert(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		title := strings.TrimSpace(m.input)
 		if title != "" {
-			store.AddTask(&m.data, title, m.date.Format("2006-01-02"))
+			store.AddTask(&m.data, title, m.date.Format("2006-01-02"), m.currentContext())
 			indices := m.tasksForDate()
 			m.cursor = len(indices) - 1
 			m.save()
@@ -575,6 +597,8 @@ func (m model) View() string {
 		w = 80
 	}
 
+	contextName := m.currentContext()
+	nextContext := m.nextContext()
 	today := time.Now().Format("2006-01-02")
 	viewDate := m.date.Format("2006-01-02")
 	isToday := today == viewDate
@@ -608,7 +632,7 @@ func (m model) View() string {
 	indices := m.tasksForDate()
 
 	if len(indices) == 0 && m.mode == modeNormal {
-		b.WriteString(centerText(helpStyle.Render("no tasks for this day — press + to add one"), w))
+		b.WriteString(centerText(helpStyle.Render(fmt.Sprintf("no %s tasks for this day — press + to add one", contextName)), w))
 		b.WriteString("\n")
 	}
 
@@ -702,7 +726,7 @@ func (m model) View() string {
 
 	if m.mode == modeInsert {
 		b.WriteString("\n")
-		b.WriteString(pad + inputStyle.Render(fmt.Sprintf("new task: %s_", m.input)))
+		b.WriteString(pad + inputStyle.Render(fmt.Sprintf("new %s task: %s_", contextName, m.input)))
 		b.WriteString("\n")
 	}
 
@@ -736,6 +760,7 @@ func (m model) View() string {
 			"enter   toggle done",
 			"s       start/stop timer",
 			"T       add time manually",
+			"p       toggle work/personal list",
 			"d/x     delete task",
 			"n       send notification",
 			"j/k     move up/down",
@@ -767,12 +792,14 @@ func (m model) View() string {
 	}
 
 	contentLines := strings.Count(b.String(), "\n")
-	padding := m.height - contentLines - 2
+	padding := m.height - contentLines - 3
 	if padding > 0 {
 		b.WriteString(strings.Repeat("\n", padding))
 	}
 
-	b.WriteString(centerText(helpStyle.Render("? help  q quit"), w))
+	b.WriteString(centerText(selectedStyle.Render("["+strings.ToUpper(contextName)+"]"), w))
+	b.WriteString("\n")
+	b.WriteString(centerText(helpStyle.Render(fmt.Sprintf("? help  p %s  q quit", nextContext)), w))
 	b.WriteString("\n")
 
 	return b.String()
